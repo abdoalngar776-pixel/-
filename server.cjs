@@ -574,7 +574,7 @@ app.get('/manifest.webmanifest', (req, res) => {
     name: 'OPS System',
     short_name: 'OPS',
     description: 'لوحة تحكم بوت OPS System',
-    start_url: '/dashboard',
+    start_url: '/',
     scope: '/',
     display: 'standalone',
     orientation: 'portrait',
@@ -582,22 +582,54 @@ app.get('/manifest.webmanifest', (req, res) => {
     lang: 'ar',
     background_color: '#050506',
     theme_color: '#050506',
+    id: '/',
+    categories: ['utilities', 'productivity'],
+    prefer_related_applications: false,
     icons: [
       { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
       { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      { src: '/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
     ],
   }));
 });
 // نفس صورة اللوجو بس بأحجام مطلوبة للأيقونة
-app.get('/icon-192.png', (req, res) => fs.existsSync(path.join(__dirname, 'icon-192.png')) ? res.sendFile(path.join(__dirname, 'icon-192.png')) : proxyImage(() => LOGO_URL)(req, res));
-app.get('/icon-512.png', (req, res) => fs.existsSync(path.join(__dirname, 'icon-512.png')) ? res.sendFile(path.join(__dirname, 'icon-512.png')) : proxyImage(() => LOGO_URL)(req, res));
+// أيقونات PNG مربعة حقيقية (كروم/سامسونج/ايفون بيطلبوها بالحجم الصح)
+const iconCache = {};
+async function makeIcon(size, maskable) {
+  const key = size + (maskable ? 'm' : '');
+  if (iconCache[key]) return iconCache[key];
+  const local = path.join(__dirname, `icon-${size}.png`);
+  if (!maskable && fs.existsSync(local)) return (iconCache[key] = fs.readFileSync(local));
+  if (!canvasLib) return null;
+  const r = await fetch(LOGO_URL, { signal: AbortSignal.timeout(10000) });
+  if (!r.ok) return null;
+  const img = await canvasLib.loadImage(Buffer.from(await r.arrayBuffer()));
+  const cv = canvasLib.createCanvas(size, size), c = cv.getContext('2d');
+  c.fillStyle = '#050506'; c.fillRect(0, 0, size, size);
+  const pad = maskable ? size * 0.2 : size * 0.06;          // maskable لازم يكون بالمنطقة الآمنة
+  const s = Math.min(size - pad * 2, size - pad * 2);
+  const k = Math.min(s / img.width, s / img.height);
+  const w = img.width * k, h = img.height * k;
+  c.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+  return (iconCache[key] = cv.toBuffer('image/png'));
+}
+const sendIcon = (size, maskable) => async (req, res) => {
+  try {
+    const buf = await makeIcon(size, maskable);
+    if (!buf) return proxyImage(() => LOGO_URL)(req, res);
+    res.set('Cache-Control', 'public, max-age=86400').type('image/png').send(buf);
+  } catch (e) { proxyImage(() => LOGO_URL)(req, res); }
+};
+app.get('/icon-192.png', sendIcon(192, false));
+app.get('/icon-512.png', sendIcon(512, false));
+app.get('/icon-maskable-512.png', sendIcon(512, true));
+app.get('/apple-touch-icon.png', sendIcon(180, false));
 // Service Worker: لازم يكون من الجذر. ما بيخزن أي شي من /api عشان البيانات تضل حية
 app.get('/sw.js', (req, res) => {
   res.set({ 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' });
   res.type('application/javascript').send(`
-const CACHE = 'ops-shell-v1';
-const SHELL = ['/style.css', '/logo.png', '/bg.jpg'];
+const CACHE = 'ops-shell-v2';
+const SHELL = ['/style.css', '/logo.png', '/bg.jpg', '/icon-192.png', '/icon-512.png'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
   self.skipWaiting();
@@ -16506,13 +16538,14 @@ const INDEX_HTML = `<!doctype html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="OPS">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <link rel="apple-touch-icon" href="/icon-192.png">
-  <link rel="icon" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="/icon-192.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
 </head>
+<script>window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); window.__dp = e; });</script>
 <body data-page="landing">
   <header class="topbar">
     <div class="brand">
@@ -16527,9 +16560,10 @@ const INDEX_HTML = `<!doctype html>
       <p class="hero-desc">OPS System هو بوت ديسكورد عربي متكامل: حماية ضد التخريب (Anti-Nuke)، نظام تذاكر، أوامر إدارية، لوقات مفصلة، ترحيب بالصور، مستويات، واقتصاد داخلي، كله من لوحة تحكم سهلة.</p>
       <div id="notice" class="notice" role="alert">تعذّر تسجيل الدخول. حاول مرة أخرى.</div>
       <div class="hero-btns">
+        <button class="hbtn solid" id="installTop" type="button" style="cursor:pointer;display:none">⬇ ثبّت التطبيق أولاً</button>
         <a class="hbtn solid" id="enterBtn" href="/login"><i class="boltbadge"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg></i><span class="bt"><span id="enterT">تفعيل النظام</span></span></a>
         <a class="hbtn line" href="#explore">↓ استكشاف</a>
-        <button class="hbtn line" id="installHome" type="button" style="display:none;cursor:pointer">⬇ تثبيت OPS System</button>
+        <button class="hbtn line" id="installHome" type="button" style="cursor:pointer">⬇ تثبيت OPS System</button>
       </div>
     </div>
   </section>
@@ -16553,27 +16587,52 @@ const INDEX_HTML = `<!doctype html>
   <script>
   (function(){if(!window.chatbase||window.chatbase("getState")!=="initialized"){window.chatbase=(...arguments)=>{if(!window.chatbase.q){window.chatbase.q=[]}window.chatbase.q.push(arguments)};window.chatbase=new Proxy(window.chatbase,{get(target,prop){if(prop==="q"){return target.q}return(...args)=>target(prop,...args)}})}const onLoad=function(){const script=document.createElement("script");script.src="https://www.chatbase.co/embed.min.js";script.id="2-OQa7Y4SpHBj5SjNjK-F";script.domain="www.chatbase.co";document.body.appendChild(script)};if(document.readyState==="complete"){onLoad()}else{window.addEventListener("load",onLoad)}})();
   </script>
-    <script>
-  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+  <script>
+  if ('serviceWorker' in navigator) window.addEventListener('load', function () { navigator.serviceWorker.register('/sw.js').catch(function () {}); });
   (function () {
-    var btn = document.getElementById('installHome'), dp = null;
-    var standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-    if (!btn || standalone) return;
-    var ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
-    // آيفون ما فيه beforeinstallprompt: نعرض الزر ونشرح الخطوات
-    if (ios) btn.style.display = 'inline-flex';
-    window.addEventListener('beforeinstallprompt', function (e) {
-      e.preventDefault(); dp = e; btn.style.display = 'inline-flex';
-    });
-    btn.addEventListener('click', function () {
+    var btns = [document.getElementById('installHome'), document.getElementById('installTop')].filter(Boolean);
+    var dp = window.__dp || null;
+    var standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+    var ua = navigator.userAgent;
+    var ios = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    var android = /android/i.test(ua);
+    if (standalone) { btns.forEach(function (b) { b.style.display = 'none'; }); return; }
+
+    var show = function () { btns.forEach(function (b) { b.style.display = 'inline-flex'; }); };
+    show();
+
+    window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); dp = e; window.__dp = e; show(); });
+    window.addEventListener('appinstalled', function () { btns.forEach(function (b) { b.style.display = 'none'; }); });
+
+    function help() {
+      var m = document.createElement('div');
+      m.style.cssText = 'position:fixed;inset:0;z-index:999;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.75);backdrop-filter:blur(6px)';
+      var steps = ios
+        ? ['اضغط زر المشاركة (Share) ⬆️ بالأسفل (بمتصفح سفاري)', 'اختر «إضافة إلى الشاشة الرئيسية»', 'اضغط «إضافة»']
+        : android
+          ? ['اضغط ⋮ (القائمة) بأعلى المتصفح', 'اختر «تثبيت التطبيق» أو «إضافة إلى الشاشة الرئيسية»']
+          : ['اضغط أيقونة التثبيت ⊕ بشريط العنوان (كروم/إيدج)', 'أو من القائمة ⋮ ← «تثبيت OPS System»'];
+      m.innerHTML = '<div style="width:min(420px,100%);background:#0e0e12;border:1px solid #2a2b33;border-radius:26px;padding:28px 24px;text-align:center;color:#fff;font-family:Cairo,sans-serif;display:grid;gap:14px">' +
+        '<h3 style="font-size:1.3rem">تثبيت OPS System</h3>' +
+        '<ol style="text-align:start;line-height:2.2;padding-inline-start:22px;color:#c9ccd6">' + steps.map(function (s) { return '<li>' + s + '</li>'; }).join('') + '</ol>' +
+        (ios ? '<small style="color:#fbbf24">ملاحظة: على الآيفون لازم تفتح الموقع من سفاري.</small>' : '') +
+        '<button id="cmClose" style="height:50px;border-radius:16px;border:0;background:#fff;color:#000;font:800 1rem Cairo,sans-serif;cursor:pointer">تمام</button></div>';
+      document.body.appendChild(m);
+      m.addEventListener('click', function (e) { if (e.target === m || e.target.id === 'cmClose') m.remove(); });
+    }
+
+    function install() {
       if (dp) {
         dp.prompt();
-        dp.userChoice.finally(function () { dp = null; btn.style.display = 'none'; });
-      } else if (ios) {
-        alert('لتثبيت التطبيق على الآيفون:\n1) اضغط زر المشاركة (Share) بسفاري\n2) اختر "إضافة إلى الشاشة الرئيسية"');
-      }
-    });
-    window.addEventListener('appinstalled', function () { btn.style.display = 'none'; });
+        dp.userChoice.finally(function () { dp = null; window.__dp = null; });
+      } else help();
+    }
+    btns.forEach(function (b) { b.addEventListener('click', install); });
+
+    // قبل التفعيل: ظهّر زر "ثبّت التطبيق أولاً" لو المستخدم لسا ما دخل
+    var top = document.getElementById('installTop'), enter = document.getElementById('enterBtn');
+    if (top && enter && !enter.classList.contains('entered')) top.style.display = 'inline-flex';
+    else if (top) top.style.display = 'none';
   })();
   </script>
   <script src="/app.js"></script>
@@ -16616,14 +16675,24 @@ const DASH_HTML = `<!doctype html>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <button id="installBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:#fff;color:#000;font:800 .9rem Cairo,sans-serif;cursor:pointer">ثبّت التطبيق</button>
+      <script>window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); window.__dp = e; });</script>
       <button id="burger" class="burger" type="button" aria-label="القائمة"></button>
     </div>
     <script>
     (function(){
-      var dp, b = document.getElementById('installBtn');
-      window.addEventListener('beforeinstallprompt', function(e){ e.preventDefault(); dp = e; if (b) b.style.display = 'inline-block'; });
-      if (b) b.addEventListener('click', function(){ if (!dp) return; dp.prompt(); dp.userChoice.finally(function(){ dp = null; b.style.display = 'none'; }); });
-      window.addEventListener('appinstalled', function(){ if (b) b.style.display = 'none'; });
+      var b = document.getElementById('installBtn'), dp = window.__dp || null;
+      var standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+      if (!b || standalone) return;
+      var ua = navigator.userAgent;
+      var ios = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      b.style.display = 'inline-block';
+      window.addEventListener('beforeinstallprompt', function(e){ e.preventDefault(); dp = e; window.__dp = e; });
+      window.addEventListener('appinstalled', function(){ b.style.display = 'none'; });
+      b.addEventListener('click', function(){
+        if (dp) { dp.prompt(); dp.userChoice.finally(function(){ dp = null; window.__dp = null; }); return; }
+        alert(ios ? 'لتثبيت التطبيق:\n1) اضغط زر المشاركة (Share) بسفاري\n2) اختر "إضافة إلى الشاشة الرئيسية"'
+                  : 'لتثبيت التطبيق: افتح قائمة المتصفح ⋮ واختر "تثبيت التطبيق" أو "إضافة إلى الشاشة الرئيسية".');
+      });
     })();
     </script>
   </header>
@@ -16633,9 +16702,7 @@ const DASH_HTML = `<!doctype html>
     <div id="panel" class="panel"></div>
   </aside>
   <main id="view" class="dmain"></main>
-    <script>
-  (function(){ ... كود Chatbase ... })();
-  </script>
+  
     <script>
   if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
   </script>
