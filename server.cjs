@@ -16727,7 +16727,7 @@ const DASH_HTML = `<!doctype html>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <button id="installBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:#fff;color:#000;font:800 .9rem Cairo,sans-serif;cursor:pointer">ثبّت التطبيق</button>
-            <button id="pushBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:transparent;color:#fff;font:800 .9rem Cairo,sans-serif;cursor:pointer">🔔 فعّل الإشعارات</button>
+      <button id="pushBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:transparent;color:#fff;font:800 .9rem Cairo,sans-serif;cursor:pointer">🔔 فعّل الإشعارات</button>
       <script>
       (function () {
         var b = document.getElementById('pushBtn');
@@ -16737,26 +16737,31 @@ const DASH_HTML = `<!doctype html>
           for (var i = 0; i < raw.length; i++) o[i] = raw.charCodeAt(i);
           return o;
         }
-        function sub(ask) {
-          return fetch('/api/push/key').then(function (r) { return r.json(); }).then(function (j) {
-            if (!j.key) throw new Error('off');
-            return (ask ? Notification.requestPermission() : Promise.resolve(Notification.permission)).then(function (perm) {
-              if (perm !== 'granted') throw new Error('denied');
-              return navigator.serviceWorker.ready;
-            }).then(function (reg) {
-              return reg.pushManager.getSubscription().then(function (s) {
-                return s || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: u8(j.key) });
-              });
-            });
-          }).then(function (s) {
-            return fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sub: s.toJSON() }) });
-          });
+        async function subscribe(perm) {
+          if (perm !== 'granted') throw new Error('denied');
+          var j = await (await fetch('/api/push/key')).json();
+          if (!j.key) throw new Error('off');
+          var reg = await navigator.serviceWorker.register('/sw.js');
+          await navigator.serviceWorker.ready;
+          var s = await reg.pushManager.getSubscription();
+          if (!s) s = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: u8(j.key) });
+          var r = await fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sub: s.toJSON() }) });
+          if (!r.ok) throw new Error('save');
         }
-        if (Notification.permission === 'granted') { sub(false).catch(function () {}); return; }
+        if (Notification.permission === 'granted') { subscribe('granted').catch(function () {}); return; }
         if (Notification.permission === 'denied') return;
         b.style.display = 'inline-block';
         b.addEventListener('click', function () {
-          sub(true).then(function () { b.style.display = 'none'; }).catch(function () { alert('ما انفعلت الإشعارات. تأكد إنك سمحت للإشعارات من المتصفح.'); });
+          Notification.requestPermission().then(subscribe).then(function () {
+            b.style.display = 'none';
+            alert('تم تفعيل الإشعارات ✅');
+          }).catch(function (err) {
+            var m = String((err && err.message) || err);
+            alert(m === 'off' ? 'السيرفر ما عنده مفاتيح VAPID أو مكتبة web-push مو مثبتة.'
+              : m === 'denied' ? 'ما انسمح بالإشعارات. اضغط القفل جنب الرابط ← الإشعارات ← سماح.'
+              : m === 'save' ? 'فشل حفظ الاشتراك بالسيرفر.'
+              : 'خطأ: ' + m);
+          });
         });
       })();
       </script>
