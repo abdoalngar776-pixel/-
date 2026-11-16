@@ -858,7 +858,7 @@ app.get('/api/me', auth, (req, res) => {
     ...req.session.user,
     bot: { enabled: botEnabled, online: botReady },
     supportUrl: SUPPORT_URL,
-    inviteUrl: INVITE_URL,
+    isOwner: OWNER_IDS.includes(req.session.user.id),
   });
 });
 
@@ -1027,10 +1027,11 @@ app.get('/api/subscriptions', auth, wrap(async (req, res) => {
   for (const g of shared) {
     const p = db.premium[g.id];
     if (!(p && p.history && p.history.length)) continue;
-    let status;
-    if (p.until > now) status = p.until - now <= 3 * 864e5 ? 'soon' : 'active';
-    else status = p.cancelled ? 'cancelled' : 'expired';
-    out.push({ id: g.id, name: g.name, icon: g.icon, status, active: p.until > now, until: p.until, history: p.history });
+    const base = { id: g.id, name: g.name, icon: g.icon };
+    for (const h of p.history) if (h.end <= now) out.push({ ...base, status: 'expired', active: false, until: h.end, history: [h] });
+    if (p.until > now) {
+      out.push({ ...base, status: p.until - now <= 3 * 864e5 ? 'soon' : 'active', active: true, until: p.until, history: p.history.filter((h) => h.end > now) });
+    }
   }
   res.json(out);
 }));
@@ -1054,7 +1055,8 @@ app.get('/api/admin/premium', auth, (req, res) => {
   }
   dirty = true;
   res.json({ ok: true, guild: gid, until: p.until });
-  // ===== إشعارات الويب =====
+});
+// ===== إشعارات الويب =====
 let webpush = null;
 try { webpush = require('web-push'); } catch (_) {}
 const VAPID_PUB = process.env.VAPID_PUBLIC_KEY || '';
@@ -1083,7 +1085,7 @@ async function pushAll(payload) {
     .catch((e) => { if (e.statusCode === 404 || e.statusCode === 410) dead.add(s.endpoint); })));
   if (dead.size) { db.pushSubs = l.filter((s) => !dead.has(s.endpoint)); dirty = true; }
 }
-});// ===================== آخر التحديثات =====================
+// ===================== آخر التحديثات =====================
 const UPD_DIR = path.resolve(DATA_DIR, 'ops-updates');
 const updList = () => (db.updates = Array.isArray(db.updates) ? db.updates : []);
 const isOwnerReq = (req) => OWNER_IDS.includes(req.session.user.id);
@@ -1182,7 +1184,125 @@ app.post('/api/guild/:id/premium/coin', auth, wrap(async (req, res) => {
     ecoLog(info.id, uid, -PREMIUM_COIN_PRICE, 'premium');
   dirty = true;
   res.json({ ok: true, until: p.until });
+}));// ===== دوال مشتركة للبريميوم =====
+const PREM_PERM = 4102444800000;                 // سنة 2100 = دائم
+const PREM_U = { m: 6e4, h: 36e5, d: 864e5 };
+function grantPremium(gid, uid, days, via) {
+  const now = Date.now();
+  const p = db.premium[gid] || (db.premium[gid] = { until: 0, history: [] });
+  p.history = p.history || [];
+  p.until = Math.max(now, p.until || 0) + days * 864e5;
+  p.cancelled = false;
+  p.history.push({ start: now, end: p.until, days, by: uid, via });
+  dirty = true;
+}
+
+// ===== لوحة المالك: قائمة السيرفرات + تعديل المدة =====
+app.get('/api/admin/premium-list', auth, (req, res) => {
+  if (!OWNER_IDS.includes(req.session.user.id)) return res.status(403).json({ error: 'forbidden' });
+  const list = client ? [...client.guilds.cache.values()].map((g) => ({
+    id: g.id, name: g.name, icon: g.icon, until: (db.premium[g.id] || {}).until || 0,
+  })) : [];
+  res.json({ list });
+});
+
+app.post('/api/admin/premium-set', auth, (req, res) => {
+  const uid = req.session.user.id;
+  if (!OWNER_IDS.includes(uid)) return res.status(403).json({ error: 'forbidden' });
+  const b = req.body || {};
+  const gid = String(b.guild || '');
+  if (!/^\d{15,25}$/.test(gid) || !client || !client.guilds.cache.has(gid)) return res.status(400).json({ error: 'bad_guild_id' });
+  const now = Date.now();
+  const p = db.premium[gid] || (db.premium[gid] = { until: 0, history: [] });
+  p.history = p.history || [];
+  const live = p.until > now;
+  const perm = p.until >= PREM_PERM;
+  const ms = Number(b.n) * (PREM_U[b.unit] || 0);
+  const clamp = () => p.history.forEach((h) => { if (h.end > p.until) h.end = p.until; });
+
+  if (b.action === 'permanent') {
+    p.until = PREM_PERM; p.cancelled = false;
+    p.history.push({ start: now, end: PREM_PERM, days: 0, by: uid, perm: true });
+  } else if (b.action === 'add') {
+    if (!(ms > 0 && ms <= 3650 * 864e5)) return res.status(400).json({ error: 'bad_amount' });
+    if (perm) return res.status(400).json({ error: 'is_permanent' });
+    p.until = Math.max(now, p.until) + ms; p.cancelled = false;
+    p.history.push({ start: now, end: p.until, days: Math.max(1, Math.round(ms / 864e5)), by: uid });
+  } else if (b.action === 'reduce') {
+    if (!(ms > 0)) return res.status(400).json({ error: 'bad_amount' });
+    if (perm) return res.status(400).json({ error: 'is_permanent' });
+    if (!live) return res.status(400).json({ error: 'not_active' });
+    p.until = Math.max(now, p.until - ms); clamp();
+  } else if (b.action === 'cancel') {
+    if (!live) return res.status(400).json({ error: 'not_active' });
+    p.until = now; clamp();
+  } else return res.status(400).json({ error: 'bad_value' });
+  dirty = true;
+  res.json({ ok: true, until: p.until });
+});
+
+// ===== PayPal =====
+const PP_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PP_SECRET = process.env.PAYPAL_SECRET || '';
+const PP_BASE = process.env.PAYPAL_MODE === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+async function ppToken() {
+  const r = await fetch(PP_BASE + '/v1/oauth2/token', {
+    method: 'POST',
+    headers: { Authorization: 'Basic ' + Buffer.from(PP_ID + ':' + PP_SECRET).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  });
+  if (!r.ok) throw new Error('paypal auth ' + r.status);
+  return (await r.json()).access_token;
+}
+
+app.post('/api/guild/:id/paypal/create', auth, wrap(async (req, res) => {
+  const info = await ctxGuild(req, res, { manage: true }); if (!info) return;
+  if (!PP_ID || !PP_SECRET) return res.status(400).json({ error: 'paypal_off' });
+  const b = req.body || {};
+  const year = b.plan === 'year';
+  const months = Math.min(11, Math.max(1, parseInt(b.months, 10) || 1));
+  const price = (year ? 49.99 : 4.99 * months).toFixed(2);   // السعر ينحسب هون مو من المتصفح
+  const days = year ? 365 : 30 * months;
+  const tok = await ppToken();
+  const r = await fetch(PP_BASE + '/v2/checkout/orders', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      intent: 'CAPTURE',
+      purchase_units: [{ description: `OPS Premium ${days} days`, amount: { currency_code: 'USD', value: price } }],
+      application_context: { brand_name: 'OPS System', user_action: 'PAY_NOW', return_url: SITE_URL + '/paypal/return', cancel_url: SITE_URL + '/dashboard#/g/' + info.id + '/premium' },
+    }),
+  });
+  const j = await r.json();
+  const link = ((j.links || []).find((l) => l.rel === 'approve' || l.rel === 'payer-action') || {}).href;
+  if (!r.ok || !link) { console.error('[paypal] create:', JSON.stringify(j).slice(0, 300)); return res.status(400).json({ error: 'paypal_failed' }); }
+  db.ppOrders = db.ppOrders || {};
+  db.ppOrders[j.id] = { gid: info.id, uid: req.session.user.id, days, price, at: Date.now(), done: false };
+  dirty = true;
+  res.json({ url: link });
 }));
+
+app.get('/paypal/return', async (req, res) => {
+  if (!req.session.user) return res.redirect('/');
+  const id = String(req.query.token || '');
+  const o = (db.ppOrders || {})[id];
+  if (!o || o.uid !== req.session.user.id || o.done) return res.redirect('/dashboard');
+  const back = '/dashboard#/g/' + o.gid + '/premium';
+  o.done = true; dirty = true;                       // يمنع التفعيل مرتين
+  try {
+    const tok = await ppToken();
+    const r = await fetch(`${PP_BASE}/v2/checkout/orders/${encodeURIComponent(id)}/capture`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' },
+    });
+    const j = await r.json();
+    const caps = (((j.purchase_units || [])[0] || {}).payments || {}).captures;
+    const c = caps && caps[0];
+    if (r.ok && j.status === 'COMPLETED' && c && c.status === 'COMPLETED' && c.amount.value === o.price && c.amount.currency_code === 'USD') {
+      grantPremium(o.gid, o.uid, o.days, 'paypal');
+    } else { o.done = false; console.error('[paypal] capture:', JSON.stringify(j).slice(0, 300)); }
+  } catch (e) { o.done = false; console.error('[paypal] capture:', e.message); }
+  res.redirect(back);
+});
 // ===== إعدادات السيرفر: بروفايل البوت + الحماية =====
 const S = (gid) => db.settings[gid] || (db.settings[gid] = {});
 const SNOW = /^\d{15,25}$/;
@@ -9633,9 +9753,20 @@ loadCoin();
         el('div', { class: 'phd' }, el('span', { class: 'bar' }), el('h2', {}, 'اختر الخطة')),
         el('div', { class: 'plans' }, planM, planY),
         el('div', { class: 'totalrow' }, el('span', {}, 'إجمالي السعر للباقة المختارة:'), total),
-                el('div', { class: 'btnrow' }, ['PayPal', 'Visa'].map((n) =>
-          el('button', { class: 'btn ghost small', type: 'button', onclick: () => fl2(`الدفع عبر ${n} قيد التجهيز 🚧`) },
-            icon('card'), n, el('span', { class: 'pbadge' }, 'قيد التجهيز')))),
+        el('div', { class: 'btnrow' },
+          el('button', {
+            class: 'btn primary small', type: 'button',
+            onclick: async (e) => {
+              if (!g) return fl2('افتح صفحة البريميوم من داخل سيرفر عشان تدفع له.');
+              const b = e.currentTarget; b.disabled = true;
+              try {
+                const j = await apiSend('POST', `/api/guild/${r.gid}/paypal/create`, { plan, months });
+                location.href = j.url;
+              } catch (er) { b.disabled = false; fl2(errText(er)); }
+            },
+          }, icon('wallet'), 'ادفع عبر PayPal'),
+          el('button', { class: 'btn ghost small', type: 'button', onclick: () => fl2('الدفع بالفيزا قيد التجهيز 🚧') },
+            icon('card'), 'Visa', el('span', { class: 'pbadge' }, 'قيد التجهيز'))),
         el('a', { class: 'btn primary wide', href: me.supportUrl, target: '_blank', rel: 'noopener' }, 'فتح تذكرة الشراء بالدسكورد'),
         el('p', { class: 'fine' }, 'بالنقر على «فتح تذكرة الشراء» فإنك توافق على شروط الاستخدام، شروط الاسترجاع وسياسة الخصوصية.')),
       el('section', { class: 'panelc' },
@@ -14644,7 +14775,7 @@ const getLists = async () => {
             el('span', { class: 'sgi' }, guildIcon(s, 44)),
             el('div', {}, el('h3', {}, s.name), el('small', { class: 'muted mono' }, s.id))),
           el('span', { class: 'stbadge ' + st[1] }, st[0])),
-        el('div', { class: 'arow' }, el('span', {}, 'ينتهي في'), el('b', {}, s.until ? fmtDate(s.until) : '—')),
+        el('div', { class: 'arow' }, el('span', {}, 'ينتهي في'), el('b', {}, s.until > 4e12 ? 'دائم' : s.until ? fmtDate(s.until) : '—')),
         s.history.slice().reverse().map((h) =>
           el('small', { class: 'muted' }, `${fmtDate(h.start)} ← ${fmtDate(h.end)} (${AR(h.days)} يوم)${h.via === 'coin' ? ' · عملات OPS' : ''}`)));
     };
@@ -14769,6 +14900,97 @@ const getLists = async () => {
       el('h1', { class: 'greet' }, 'الدليل الشامل ', el('span', { class: 'gold' }, 'OPS SYSTEM')),
       el('p', { class: 'lead' }, 'تعرف على جميع مميزات وكيفية استخدام البوت باحترافية'),
       el('div', { class: 'gacc' }, secs.map((x) => x.node)));
+  }  Object.assign(ERRS, {
+    not_active: 'السيرفر مو مفعّل عليه بريميوم حالياً.',
+    bad_amount: 'اكتب مدة صحيحة.',
+    is_permanent: 'البريميوم دائم، اضغط إلغاء أول.',
+    paypal_off: 'PayPal غير مفعّل بعد (مفاتيح PAYPAL ناقصة).',
+    paypal_failed: 'فشل إنشاء عملية PayPal، حاول مرة ثانية.',
+  });
+
+  function pagePremAdmin() {
+    const box = el('div', { class: 'page' });
+    const fl = flasher();
+    let list = [], q = '';
+    const out = el('div', { class: 'stack' });
+    const PERM = 4e12;
+    const leftTxt = (u) => {
+      const ms = u - Date.now();
+      if (u > PERM) return 'دائم';
+      if (ms <= 0) return 'غير مفعّل';
+      return `${Math.floor(ms / 864e5)} يوم ${Math.floor((ms % 864e5) / 36e5)} ساعة ${Math.floor((ms % 36e5) / 6e4)} دقيقة`;
+    };
+
+    // نافذة بنص الشاشة: رقم + (أيام / ساعات / دقائق)
+    const durModal = (title, okText, onOk) => {
+      const close = () => { ov.remove(); document.removeEventListener('keydown', onKey); };
+      const onKey = (e) => { if (e.key === 'Escape') close(); };
+      const n = el('input', { class: 'inp', type: 'number', min: 1, value: 10, 'aria-label': 'المدة' });
+      const u = el('select', { class: 'sel', 'aria-label': 'الوحدة' },
+        [['d', 'أيام'], ['h', 'ساعات'], ['m', 'دقائق']].map(([v, t]) => el('option', { value: v }, t)));
+      const ov = el('div', { class: 'cm-ov', role: 'dialog', 'aria-modal': 'true', onclick: (e) => { if (e.target === ov) close(); } },
+        el('div', { class: 'cm-box' },
+          el('h3', {}, title),
+          el('div', { class: 'actrow2' }, n, u),
+          el('div', { class: 'cm-btns' },
+            el('button', { class: 'cm-btn ok', type: 'button', onclick: async () => { await onOk(Number(n.value), u.value); close(); } }, okText),
+            el('button', { class: 'cm-btn cancel', type: 'button', onclick: close }, 'إلغاء'))));
+      document.body.append(ov);
+      document.addEventListener('keydown', onKey);
+      n.focus();
+    };
+
+    const openServer = (s) => {
+      const close = () => { ov.remove(); document.removeEventListener('keydown', onKey); };
+      const onKey = (e) => { if (e.key === 'Escape') close(); };
+      const info = el('b', { class: 'goldc' }, leftTxt(s.until));
+      const act = async (action, n, unit) => {
+        try {
+          const j = await apiSend('POST', '/api/admin/premium-set', { guild: s.id, action, n, unit });
+          s.until = j.until; info.textContent = leftTxt(s.until); fl.show('تم ✅'); draw();
+        } catch (e) { fl.show(errText(e), false); }
+      };
+      const ask = async (title, action) => {
+        if (await confirmModal({ title, text: s.name, okText: 'تأكيد', cancelText: 'رجوع' })) act(action);
+      };
+      const ov = el('div', { class: 'cm-ov', role: 'dialog', 'aria-modal': 'true', onclick: (e) => { if (e.target === ov) close(); } },
+        el('div', { class: 'cm-box lm' },
+          el('div', { class: 'rowbar' }, el('h3', {}, s.name),
+            el('button', { class: 'btn ghost small', type: 'button', 'aria-label': 'إغلاق', onclick: close }, icon('close'))),
+          el('div', { class: 'arow' }, el('span', {}, 'المدة الحالية'), info),
+          el('button', { class: 'btn primary wide', type: 'button', onclick: () => ask('تفعيل بريميوم دائم؟', 'permanent') }, icon('crown'), 'تفعيل بريميوم دائم'),
+          el('button', { class: 'btn ghost wide', type: 'button', onclick: () => durModal('إضافة مدة', 'إضافة', (n, u) => act('add', n, u)) }, icon('plus'), 'إضافة مدة'),
+          el('button', { class: 'btn ghost wide', type: 'button', onclick: () => durModal('تقليل المدة', 'تقليل', (n, u) => act('reduce', n, u)) }, 'تقليل المدة'),
+          el('button', { class: 'btn ghost wide danger', type: 'button', onclick: () => ask('إلغاء البريميوم؟', 'cancel') }, icon('trash'), 'إلغاء')));
+      document.body.append(ov);
+      document.addEventListener('keydown', onKey);
+    };
+
+    const draw = () => {
+      const l = list.filter((s) => !q || s.name.toLowerCase().includes(q) || s.id.includes(q));
+      put(out, l.length
+        ? l.map((s) => el('div', { class: 'lrow' },
+            el('span', { class: 'sgi' }, guildIcon(s, 40)),
+            el('span', { class: 'nm' }, s.name, el('small', { class: 'muted mono' }, s.id)),
+            el('span', { class: 'stbadge ' + (s.until > Date.now() ? 'on' : 'off') }, leftTxt(s.until)),
+            el('button', { class: 'btn primary small', type: 'button', onclick: () => openServer(s) }, icon('crown'), 'تفعيل بريميوم')))
+        : el('div', { class: 'empty' }, 'ما في سيرفرات.'));
+    };
+    const search = el('input', { class: 'inp', type: 'search', placeholder: 'بحث باسم السيرفر أو الايدي...', 'aria-label': 'بحث' });
+    search.addEventListener('input', () => { q = search.value.trim().toLowerCase(); draw(); });
+
+    async function load() {
+      try { list = (await api('/api/admin/premium-list')).list; } catch (e) { put(box, errorBox(load)); return; }
+      put(box,
+        el('p', { class: 'eyebrow' }, 'OWNER ONLY'),
+        el('h1', { class: 'greet' }, 'تفعيل البريميوم'),
+        el('p', { class: 'lead' }, 'كل السيرفرات اللي فيها البوت. اضغط تفعيل بريميوم جنب أي سيرفر.'),
+        fl, el('section', { class: 'panelc' }, search), out);
+      draw();
+    }
+    put(box, el('p', { class: 'muted center' }, 'جاري التحميل...'));
+    load();
+    return box;
   }
   function pageNoBot(g) {
     return el('div', { class: 'page' },
@@ -15403,6 +15625,7 @@ const getLists = async () => {
         { id: 'premium', label: 'الاشتراكات والبريميوم', ic: 'crown', href: '#/premium' },
         { id: 'servers', label: 'السيرفرات', ic: 'grid', href: '#/servers' },
         { id: 'leaders', label: 'لوحة المتصدرين', ic: 'trophy', href: '#/leaders' },
+                ...(me.isOwner ? [{ id: 'premadmin', label: 'تفعيل البريميوم (مالك)', ic: 'crown', href: '#/premadmin' }] : []),
         { id: 'transactions', label: 'سجل عمليات OPS', ic: 'coin', href: '#/transactions' },
         { id: 'updates', label: 'آخر التحديثات', ic: 'megaphone', href: '#/updates', badge: newUpd ? 'NEW' : null },        { id: 'guide', label: 'الدليل والشروحات', ic: 'book', href: '#/guide' },
         { id: 'support', label: 'الدعم الفني', ic: 'lifebuoy', href: 'https://discord.gg/XN6RfY4nc', ext: true },
@@ -15435,7 +15658,7 @@ const getLists = async () => {
           ? guildPage(r)
           : el('div', { class: 'empty' }, 'هذا السيرفر غير متاح. تأكد أن البوت موجود فيه وأنك عضو فيه.');
       } else {
-        node = r.page === 'premium' ? pagePremium(r) : r.page === 'updates' ? pageUpdates() : r.page === 'guide' ? pageGuide() : r.page === 'transactions' ? pageTransactions() : r.page === 'leaders' ? await pageLeaders() : r.page === 'servers' ? pageServers() : await pageHome();
+        node = r.page === 'premium' ? pagePremium(r) : r.page === 'premadmin' && me.isOwner ? pagePremAdmin() : r.page === 'updates' ? pageUpdates() : r.page === 'guide' ? pageGuide() : r.page === 'transactions' ? pageTransactions() : r.page === 'leaders' ? await pageLeaders() : r.page === 'servers' ? pageServers() : await pageHome();
       }
       if (my !== token) return;
       put(view, node);
