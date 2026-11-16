@@ -630,6 +630,22 @@ app.get('/sw.js', (req, res) => {
   res.type('application/javascript').send(`
 const CACHE = 'ops-shell-v2';
 const SHELL = ['/style.css', '/logo.png', '/bg.jpg', '/icon-192.png', '/icon-512.png'];
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (_) {}
+  e.waitUntil(self.registration.showNotification(d.title || 'OPS System', {
+    body: d.body || '', icon: '/icon-192.png', badge: '/icon-192.png', dir: 'rtl', lang: 'ar',
+    data: { url: d.url || '/dashboard' },
+  }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || '/dashboard';
+  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+    for (const c of list) { if ('focus' in c) { c.navigate(url).catch(() => {}); return c.focus(); } }
+    return clients.openWindow(url);
+  }));
+});
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
   self.skipWaiting();
@@ -1038,6 +1054,35 @@ app.get('/api/admin/premium', auth, (req, res) => {
   }
   dirty = true;
   res.json({ ok: true, guild: gid, until: p.until });
+  // ===== إشعارات الويب =====
+let webpush = null;
+try { webpush = require('web-push'); } catch (_) {}
+const VAPID_PUB = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIV = process.env.VAPID_PRIVATE_KEY || '';
+const pushOn = !!(webpush && VAPID_PUB && VAPID_PRIV);
+if (pushOn) webpush.setVapidDetails(SITE_URL || 'mailto:admin@example.com', VAPID_PUB, VAPID_PRIV);
+const pushList = () => (db.pushSubs = Array.isArray(db.pushSubs) ? db.pushSubs : []);
+
+app.get('/api/push/key', auth, (req, res) => res.json({ key: pushOn ? VAPID_PUB : null }));
+app.post('/api/push/subscribe', auth, (req, res) => {
+  if (!pushOn) return res.status(400).json({ error: 'push_off' });
+  const s = (req.body || {}).sub;
+  if (!s || typeof s.endpoint !== 'string' || !/^https:\/\//.test(s.endpoint) || !s.keys || !s.keys.p256dh || !s.keys.auth) return res.status(400).json({ error: 'bad_value' });
+  const l = pushList();
+  const rec = { endpoint: s.endpoint, keys: { p256dh: String(s.keys.p256dh), auth: String(s.keys.auth) }, uid: req.session.user.id, at: Date.now() };
+  const i = l.findIndex((x) => x.endpoint === s.endpoint);
+  if (i >= 0) l[i] = rec; else l.push(rec);
+  dirty = true;
+  res.json({ ok: true });
+});
+async function pushAll(payload) {
+  if (!pushOn) return;
+  const body = JSON.stringify(payload);
+  const l = pushList(), dead = new Set();
+  await Promise.all(l.map((s) => webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, body)
+    .catch((e) => { if (e.statusCode === 404 || e.statusCode === 410) dead.add(s.endpoint); })));
+  if (dead.size) { db.pushSubs = l.filter((s) => !dead.has(s.endpoint)); dirty = true; }
+}
 });// ===================== آخر التحديثات =====================
 const UPD_DIR = path.resolve(DATA_DIR, 'ops-updates');
 const updList = () => (db.updates = Array.isArray(db.updates) ? db.updates : []);
@@ -1073,6 +1118,7 @@ app.post('/api/updates', auth, (req, res) => {
     }
   } catch (e) { console.error(e); return res.status(500).json({ error: 'server_error' }); }
   updList().push({ id: crypto.randomBytes(5).toString('hex'), text, images: names, at: Date.now(), by: req.session.user.id });
+    pushAll({ title: 'NEW 🆕 آخر التحديثات - OPS System', body: (text || 'تحديث جديد').slice(0, 120), url: '/dashboard#/updates' }).catch(() => {});
   dirty = true;
   res.json({ ok: true });
 });
@@ -9260,7 +9306,7 @@ for (const kid of kids.flat(Infinity)) {
     return r.json();
   }
 
-  let me = null, guilds = [], allGuilds = [], timer = null, token = 0;
+  let me = null, guilds = [], allGuilds = [], timer = null, token = 0, newUpd = false;
   const setRefresh = (fn) => { clearInterval(timer); timer = setInterval(fn, 30000); };
 
   const initials = (n) => [...String(n).replace(/[^\p{L}\p{N} ]/gu, '').trim()].slice(0, 2).join('') || '؟';
@@ -14496,6 +14542,7 @@ const getLists = async () => {
 
     async function load() {
       try { d = await api('/api/updates'); } catch (e) { put(box, errorBox(load)); return; }
+            try { localStorage.setItem('updSeen', String(Math.max(0, ...d.list.map((x) => x.at)))); newUpd = false; } catch (_) {}
       build();
     }
     async function del(u) {
@@ -14547,6 +14594,7 @@ const getLists = async () => {
     const card = (u) => el('article', { class: 'panelc upd' },
       el('div', { class: 'rowbar' },
         el('span', { class: 'chip' }, dt(u.at)),
+                el('span', { class: 'chip' }, dt(u.at), Date.now() - u.at < 3 * 864e5 ? el('em', { class: 'newb' }, 'NEW') : null),
         d.isOwner ? el('button', { class: 'btn ghost small danger', type: 'button', 'aria-label': 'حذف التحديث', onclick: () => del(u) }, icon('trash')) : null),
       u.text ? el('p', { class: 'updtext' }, u.text) : null,
       u.images && u.images.length
@@ -15356,8 +15404,7 @@ const getLists = async () => {
         { id: 'servers', label: 'السيرفرات', ic: 'grid', href: '#/servers' },
         { id: 'leaders', label: 'لوحة المتصدرين', ic: 'trophy', href: '#/leaders' },
         { id: 'transactions', label: 'سجل عمليات OPS', ic: 'coin', href: '#/transactions' },
-                { id: 'updates', label: 'آخر التحديثات', ic: 'megaphone', href: '#/updates' },
-        { id: 'guide', label: 'الدليل والشروحات', ic: 'book', href: '#/guide' },
+        { id: 'updates', label: 'آخر التحديثات', ic: 'megaphone', href: '#/updates', badge: newUpd ? 'NEW' : null },        { id: 'guide', label: 'الدليل والشروحات', ic: 'book', href: '#/guide' },
         { id: 'support', label: 'الدعم الفني', ic: 'lifebuoy', href: 'https://discord.gg/XN6RfY4nc', ext: true },
       ];
     }
@@ -15410,6 +15457,11 @@ const getLists = async () => {
       [me, allGuilds] = await Promise.all([api('/api/me'), api('/api/guilds').catch(() => [])]);
       guilds = allGuilds.filter((g) => g.botIn);
       guilds.forEach((g) => { g.premiumUntil = g.premiumUntil || 0; });
+            try {
+        const u = await api('/api/updates');
+        const last = u.list.length ? Math.max(...u.list.map((x) => x.at)) : 0;
+        newUpd = last > Number(localStorage.getItem('updSeen') || 0);
+      } catch (_) {}
     } catch (e) { put(view, errorBox(() => location.reload())); return; }
     $('#burger').addEventListener('click', () => document.body.classList.toggle('open'));
     $('#scrim').addEventListener('click', () => document.body.classList.remove('open'));
@@ -16675,6 +16727,39 @@ const DASH_HTML = `<!doctype html>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <button id="installBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:#fff;color:#000;font:800 .9rem Cairo,sans-serif;cursor:pointer">ثبّت التطبيق</button>
+            <button id="pushBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:transparent;color:#fff;font:800 .9rem Cairo,sans-serif;cursor:pointer">🔔 فعّل الإشعارات</button>
+      <script>
+      (function () {
+        var b = document.getElementById('pushBtn');
+        if (!b || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return;
+        function u8(s) {
+          var p = '='.repeat((4 - s.length % 4) % 4), r = (s + p).replace(/-/g, '+').replace(/_/g, '/'), raw = atob(r), o = new Uint8Array(raw.length);
+          for (var i = 0; i < raw.length; i++) o[i] = raw.charCodeAt(i);
+          return o;
+        }
+        function sub(ask) {
+          return fetch('/api/push/key').then(function (r) { return r.json(); }).then(function (j) {
+            if (!j.key) throw new Error('off');
+            return (ask ? Notification.requestPermission() : Promise.resolve(Notification.permission)).then(function (perm) {
+              if (perm !== 'granted') throw new Error('denied');
+              return navigator.serviceWorker.ready;
+            }).then(function (reg) {
+              return reg.pushManager.getSubscription().then(function (s) {
+                return s || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: u8(j.key) });
+              });
+            });
+          }).then(function (s) {
+            return fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sub: s.toJSON() }) });
+          });
+        }
+        if (Notification.permission === 'granted') { sub(false).catch(function () {}); return; }
+        if (Notification.permission === 'denied') return;
+        b.style.display = 'inline-block';
+        b.addEventListener('click', function () {
+          sub(true).then(function () { b.style.display = 'none'; }).catch(function () { alert('ما انفعلت الإشعارات. تأكد إنك سمحت للإشعارات من المتصفح.'); });
+        });
+      })();
+      </script>
       <script>window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); window.__dp = e; });</script>
       <button id="burger" class="burger" type="button" aria-label="القائمة"></button>
     </div>
