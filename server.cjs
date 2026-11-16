@@ -568,6 +568,61 @@ function proxyImage(getUrl) {
 app.get('/bg.jpg', proxyImage(() => BG_URL));
 app.get('/logo.png', proxyImage(() => LOGO_URL));
 app.get('/style.css', (req, res) => res.type('text/css').send(CSS));
+// ===== PWA =====
+app.get('/manifest.webmanifest', (req, res) => {
+  res.type('application/manifest+json').send(JSON.stringify({
+    name: 'OPS System',
+    short_name: 'OPS',
+    description: 'لوحة تحكم بوت OPS System',
+    start_url: '/dashboard',
+    scope: '/',
+    display: 'standalone',
+    orientation: 'portrait',
+    dir: 'rtl',
+    lang: 'ar',
+    background_color: '#050506',
+    theme_color: '#050506',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+    ],
+  }));
+});
+// نفس صورة اللوجو بس بأحجام مطلوبة للأيقونة
+app.get('/icon-192.png', (req, res) => fs.existsSync(path.join(__dirname, 'icon-192.png')) ? res.sendFile(path.join(__dirname, 'icon-192.png')) : proxyImage(() => LOGO_URL)(req, res));
+app.get('/icon-512.png', (req, res) => fs.existsSync(path.join(__dirname, 'icon-512.png')) ? res.sendFile(path.join(__dirname, 'icon-512.png')) : proxyImage(() => LOGO_URL)(req, res));
+// Service Worker: لازم يكون من الجذر. ما بيخزن أي شي من /api عشان البيانات تضل حية
+app.get('/sw.js', (req, res) => {
+  res.set({ 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' });
+  res.type('application/javascript').send(`
+const CACHE = 'ops-shell-v1';
+const SHELL = ['/style.css', '/logo.png', '/bg.jpg'];
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
+  self.skipWaiting();
+});
+self.addEventListener('activate', (e) => {
+  e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', (e) => {
+  const r = e.request, u = new URL(r.url);
+  if (r.method !== 'GET' || u.origin !== location.origin) return;
+  if (u.pathname.startsWith('/api/') || u.pathname.startsWith('/auth/') || u.pathname === '/login' || u.pathname.startsWith('/transcripts/')) return;
+  if (SHELL.includes(u.pathname)) {
+    e.respondWith(caches.match(r).then((hit) => {
+      const net = fetch(r).then((res) => { caches.open(CACHE).then((c) => c.put(r, res.clone())); return res; }).catch(() => hit);
+      return hit || net;
+    }));
+    return;
+  }
+  if (r.mode === 'navigate') {
+    e.respondWith(fetch(r).catch(() => new Response('<meta charset="utf-8"><body style="background:#050506;color:#fff;font-family:sans-serif;text-align:center;padding:60px">لا يوجد اتصال بالإنترنت</body>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })));
+  }
+});
+`);
+});
 app.get('/bg.jpg', (req, res) => res.sendFile(path.join(__dirname, 'bg.jpg')));
 app.get('/logo.png', (req, res) => res.sendFile(path.join(__dirname, 'logo.png')));
 app.get('/bg.jpg', (req, res) => res.sendFile(path.join(__dirname, 'bg.jpg')));
@@ -16445,6 +16500,14 @@ const INDEX_HTML = `<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OPS COIN</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#050506">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="OPS">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="icon" href="/icon-192.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@600;700;800&display=swap" rel="stylesheet">
@@ -16466,6 +16529,7 @@ const INDEX_HTML = `<!doctype html>
       <div class="hero-btns">
         <a class="hbtn solid" id="enterBtn" href="/login"><i class="boltbadge"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg></i><span class="bt"><span id="enterT">تفعيل النظام</span></span></a>
         <a class="hbtn line" href="#explore">↓ استكشاف</a>
+        <button class="hbtn line" id="installHome" type="button" style="display:none;cursor:pointer">⬇ تثبيت OPS System</button>
       </div>
     </div>
   </section>
@@ -16489,6 +16553,29 @@ const INDEX_HTML = `<!doctype html>
   <script>
   (function(){if(!window.chatbase||window.chatbase("getState")!=="initialized"){window.chatbase=(...arguments)=>{if(!window.chatbase.q){window.chatbase.q=[]}window.chatbase.q.push(arguments)};window.chatbase=new Proxy(window.chatbase,{get(target,prop){if(prop==="q"){return target.q}return(...args)=>target(prop,...args)}})}const onLoad=function(){const script=document.createElement("script");script.src="https://www.chatbase.co/embed.min.js";script.id="2-OQa7Y4SpHBj5SjNjK-F";script.domain="www.chatbase.co";document.body.appendChild(script)};if(document.readyState==="complete"){onLoad()}else{window.addEventListener("load",onLoad)}})();
   </script>
+    <script>
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+  (function () {
+    var btn = document.getElementById('installHome'), dp = null;
+    var standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    if (!btn || standalone) return;
+    var ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    // آيفون ما فيه beforeinstallprompt: نعرض الزر ونشرح الخطوات
+    if (ios) btn.style.display = 'inline-flex';
+    window.addEventListener('beforeinstallprompt', function (e) {
+      e.preventDefault(); dp = e; btn.style.display = 'inline-flex';
+    });
+    btn.addEventListener('click', function () {
+      if (dp) {
+        dp.prompt();
+        dp.userChoice.finally(function () { dp = null; btn.style.display = 'none'; });
+      } else if (ios) {
+        alert('لتثبيت التطبيق على الآيفون:\n1) اضغط زر المشاركة (Share) بسفاري\n2) اختر "إضافة إلى الشاشة الرئيسية"');
+      }
+    });
+    window.addEventListener('appinstalled', function () { btn.style.display = 'none'; });
+  })();
+  </script>
   <script src="/app.js"></script>
 </body>
 </html>`;
@@ -16497,9 +16584,17 @@ const DASH_HTML = `<!doctype html>
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>OPS System — بوت ديسكورد عربي للحماية والتذاكر والإدارة</title>
   <meta name="description" content="OPS System بوت ديسكورد متكامل مع لوحة تحكم: حماية ذكية ضد التخريب، أوامر إدارية، تذاكر، لوق، ترحيب بالصور، مستويات، واقتصاد OPS Coin.">
+    <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#050506">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="OPS">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="icon" href="/icon-192.png">
   <link rel="canonical" href="__SITE__/">
   <meta property="og:title" content="OPS System — Discord Bot">
   <meta property="og:description" content="Arabic Discord bot: anti-nuke protection, tickets, logs, levels, economy and a full dashboard.">
@@ -16519,7 +16614,18 @@ const DASH_HTML = `<!doctype html>
       <span class="brand-text">𝗢𝗣𝗦 𝗦𝗬𝗦𝗧𝗘𝗠</span>
       <img class="brand-logo" src="/logo.png" alt="OPS" title="تحديث الصفحة" role="button" tabindex="0" onclick="location.reload()" onkeydown="if(event.key==='Enter')location.reload()">
     </div>
-    <button id="burger" class="burger" type="button" aria-label="القائمة"></button>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button id="installBtn" type="button" style="display:none;height:46px;padding:0 18px;border-radius:23px;border:1px solid #fff;background:#fff;color:#000;font:800 .9rem Cairo,sans-serif;cursor:pointer">ثبّت التطبيق</button>
+      <button id="burger" class="burger" type="button" aria-label="القائمة"></button>
+    </div>
+    <script>
+    (function(){
+      var dp, b = document.getElementById('installBtn');
+      window.addEventListener('beforeinstallprompt', function(e){ e.preventDefault(); dp = e; if (b) b.style.display = 'inline-block'; });
+      if (b) b.addEventListener('click', function(){ if (!dp) return; dp.prompt(); dp.userChoice.finally(function(){ dp = null; b.style.display = 'none'; }); });
+      window.addEventListener('appinstalled', function(){ if (b) b.style.display = 'none'; });
+    })();
+    </script>
   </header>
   <div id="scrim" class="scrim"></div>
   <aside class="drawer" aria-label="القائمة">
@@ -16529,6 +16635,9 @@ const DASH_HTML = `<!doctype html>
   <main id="view" class="dmain"></main>
     <script>
   (function(){ ... كود Chatbase ... })();
+  </script>
+    <script>
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
   </script>
   <script src="/app.js"></script>
   <script src="/dash.js"></script>
